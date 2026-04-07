@@ -20,7 +20,7 @@ A Python-based benchmarking tool with a graphical interface for optimizing Bitax
 | Reset to defaults | ❌ | ✅ One-click button |
 | Real-time coloured log | Terminal only | Scrollable log panel |
 | Stop benchmark mid-run | Ctrl+C only | Stop button |
-| Full custom setting step voltage-frequency |
+| Custom step voltage-frequency | ❌ | ✅ Full size step setting |
 ---
 
 ## Supported models
