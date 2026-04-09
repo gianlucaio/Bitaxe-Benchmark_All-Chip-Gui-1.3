@@ -1,4 +1,4 @@
-# Bitaxe Hashrate Benchmark — GUI Edition
+# Bitaxe AllChip HashBench — GUI Edition
 
 A Python-based benchmarking tool with a graphical interface for optimising Bitaxe mining performance. Tests different voltage and frequency combinations while monitoring hashrate, temperature, power efficiency, and **ASIC error rate** — with full support for both **single-chip** (5V barrel jack) and **dual-chip** models (GT 800, GT 801, Duo 650 — 12V XT30).
 
