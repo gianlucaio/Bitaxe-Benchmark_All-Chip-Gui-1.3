@@ -6,10 +6,10 @@ A Python-based benchmarking tool with a graphical interface for optimising Bitax
 
 ---
 
-## What's new in v1.3
+## What's new in v1.4
 
-| Feature | v1.2 | v1.3 |
-|---|---|---|
+| Feature | v1.2 | v1.3 | v1.4 |
+v|---|---|---|
 | ASIC error-rate sampling | ❌ | ✅ Read every sample, averaged per step |
 | Error rate in JSON output | ❌ | ✅ `averageErrorRate` field in every result |
 | 📊 Analyse Results button | ❌ | ✅ Load any JSON, find the true best step |
@@ -17,8 +17,8 @@ A Python-based benchmarking tool with a graphical interface for optimising Bitax
 | Optimal error window (0.20–0.70 %) | ❌ | ✅ Highlighted separately in analysis |
 | Dark Bitcoin-themed GUI | ❌ | ✅ Full custom ttk dark theme |
 | Colour-coded analysis table | ❌ | ✅ Green / amber / red / gold rows |
-| Max voltage limit (GUI) | ❌ | ✅ User-defined ceiling for benchmark voltage sweep |
-| Max frequency limit (GUI) | ❌ | ✅ User-defined ceiling for benchmark frequency sweep |
+| Max voltage limit (GUI) | ❌ | ✅ User-defined ceiling for benchmark voltage sweep | 1.4 |
+| Max frequency limit (GUI) | ❌ | ✅ User-defined ceiling for benchmark frequency sweep | 1.4 !
 
 ## What was new in v1.2 (vs original CLI)
 
