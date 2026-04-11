@@ -1,0 +1,1799 @@
+"""
+Bitaxe All Model Hashrate Benchmark — GUI Edition  v1.6
+Supports single-chip (5V) and dual-chip models (GT 800/801, Duo 650 — 12V XT30).
+
+New in v1.6
+  • Progress bar with ETA: shows step-by-step progress and estimated time
+    remaining based on total voltage × frequency combinations.
+  • Live hashrate chart: real-time graph updated every sample during the
+    benchmark — visualises hashrate trend across all tested steps.
+  • Early-stop on declining hashrate: if hashrate drops for N consecutive
+    frequency steps at the same voltage, the frequency sweep is stopped early
+    and the benchmark moves to the next voltage level.  Configurable via GUI.
+  • Adaptive warm-up: waits for temperature to stabilise (±1 °C over 10 s)
+    instead of a fixed 40 s timer — saves time on lower voltages/frequencies.
+  • Resume from partial JSON: if a previous benchmark was interrupted, load
+    the partial JSON and skip already-tested voltage × frequency combinations.
+  • CSV export: every result is also saved as a .csv file alongside the JSON,
+    ready to open in Excel / LibreOffice Calc.
+  • Configurable error-rate threshold: ERR_MAX_VALID is now a GUI field so
+    the user can tighten or relax the acceptance window without editing code.
+  • Completion sound: plays a short system bell when the benchmark finishes.
+  • Heatmap in Analysis window: interactive voltage × frequency grid coloured
+    by hashrate or J/TH, togglable via radio buttons.
+
+New in v1.5 (carried over)
+  • Fixed benchmark sweep: now a true 2-D voltage × frequency grid.
+    The old loop only increased frequency at the starting voltage and bumped
+    voltage only on failure (1-D diagonal).  The new loop tests every
+    frequency from start_f to max_f for EACH voltage level before moving to
+    the next voltage — giving a complete picture of the chip's behaviour
+    across the full operating space.
+  • Fixed error rate reading: now reads 'errorPercentage' directly from
+    AxeOS (the field shown in the UI), matching what you see on the dashboard.
+    The old code tried non-existent field names and fell back to cumulative
+    sharesRejected/sharesAccepted — which grow from boot and are meaningless
+    within a single benchmark step.  sharesRejected fallback removed entirely.
+  • Added per-chip errorCount delta from hashrateMonitor.asics[n].errorCount
+    as a secondary error source when errorPercentage is unavailable — computed
+    as the increment between consecutive samples, not the cumulative total.
+  • Unstable steps are now recorded (with stable=false) instead of being
+    silently skipped, so the Analysis window can show them.
+  • _apply_best and _print_summary now prefer stable results; if no stable
+    step was found they fall back to the full result set with a warning.
+  • JSON output includes a "sweep" field ("2D voltage × frequency") and a
+    "stable" boolean on every result entry.
+
+New in v1.4 (carried over)
+  • max_voltage and max_frequency fields in the GUI (user-defined ceilings).
+
+New in v1.3 (carried over)
+  • Error-rate sampling (asicErrorRate / rejectRate / shares) every iteration
+  • averageErrorRate stored in the JSON for every step
+  • 📊 Analyse Results button: loads any benchmark JSON, finds the true best
+    step after filtering steps with error rate > 1 %, shows full table and
+    highlights the optimal configuration (highest HR + lowest J/TH + errors in
+    the 0.20–0.70 % sweet spot)
+  • Restyled GUI: dark Bitcoin-inspired theme, coloured header, accent buttons
+"""
+
+import requests
+import time
+import json
+import sys
+import math
+import threading
+import queue
+import csv
+import os
+from datetime import datetime, timedelta
+
+try:
+    import winsound
+    _HAS_WINSOUND = True
+except ImportError:
+    _HAS_WINSOUND = False
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext, messagebox, filedialog
+except ImportError:
+    print("ERROR: tkinter not found. Install it with: sudo apt install python3-tk")
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# DEFAULTS — shown in GUI, user can edit before starting
+# ---------------------------------------------------------------------------
+DEFAULTS = {
+    "ip":                  "",
+    "voltage":             1150,
+    "frequency":           500,
+    "max_psu_watts":       60,
+    "max_temp":            66,
+    "max_vr_temp":         86,
+    "chip_mode":           "auto",
+    "voltage_increment":   20,
+    "frequency_increment": 25,
+    "max_voltage":         1400,
+    "max_frequency":       1200,
+    "err_max_valid":       1.0,   # v1.6: configurable error threshold (%)
+    "early_stop_steps":    3,     # v1.6: consecutive declining HR steps before early stop (0=disabled)
+    "adaptive_warmup":     True,  # v1.6: wait for temp stability instead of fixed timer
+}
+
+# Benchmark constants
+VOLTAGE_INCREMENT    = DEFAULTS["voltage_increment"]
+FREQUENCY_INCREMENT  = DEFAULTS["frequency_increment"]
+SLEEP_TIME           = 40
+BENCHMARK_TIME       = 500
+SAMPLE_INTERVAL      = 15
+MAX_ALLOWED_VOLTAGE  = 1400
+MIN_ALLOWED_VOLTAGE  = 1000
+MAX_ALLOWED_FREQ     = 1200
+MIN_ALLOWED_FREQ     = 400
+
+SINGLE_CHIP_VMIN = 4800
+SINGLE_CHIP_VMAX = 5500
+DUAL_CHIP_VMIN   = 11800
+DUAL_CHIP_VMAX   = 12200
+
+DUAL_CHIP_KEYWORDS = ["gt", "duo", "800", "801", "650", "dual", "2chip"]
+DUAL_CHIP_HASHRATE_THRESHOLD_GHS = 1500
+
+# Error-rate thresholds (%)
+ERR_MAX_VALID   = 1.0    # steps above this are discarded
+ERR_OPT_LOW     = 0.20   # optimal window low
+ERR_OPT_HIGH    = 0.70   # optimal window high
+
+# ---------------------------------------------------------------------------
+# Colour palette (dark Bitcoin theme)
+# ---------------------------------------------------------------------------
+C = {
+    "bg":          "#111827",   # main window background
+    "panel":       "#1f2937",   # frame / labelframe bg
+    "card":        "#374151",   # spinbox / entry bg
+    "accent":      "#f7931a",   # Bitcoin orange
+    "accent_dark": "#c4760e",   # pressed-state orange
+    "text":        "#f3f4f6",   # primary text
+    "muted":       "#9ca3af",   # secondary text
+    "green":       "#22c55e",
+    "yellow":      "#f59e0b",
+    "red":         "#ef4444",
+    "blue":        "#3b82f6",
+    "log_bg":      "#0d1117",   # log area background
+    "separator":   "#374151",
+}
+
+
+# ---------------------------------------------------------------------------
+# Benchmark engine (runs in a background thread)
+# ---------------------------------------------------------------------------
+
+class BitaxeBenchmark:
+    def __init__(self, config: dict, log_queue: queue.Queue):
+        self.cfg         = config
+        self.q           = log_queue
+        self.stop_event  = threading.Event()
+
+        self.bitaxe_url        = f"http://{config['ip']}"
+        self.profile           = None
+        self.small_core_count  = None
+        self.asic_count        = None
+        self.default_voltage   = None
+        self.default_frequency = None
+        self.results           = list(config.get("resume_results", []))
+        self.start_time        = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+        # v1.6: configurable thresholds from GUI
+        self.err_max_valid  = config.get("err_max_valid", ERR_MAX_VALID)
+        self.early_stop_n   = config.get("early_stop_steps", 3)
+        self.adaptive_warmup = config.get("adaptive_warmup", True)
+
+        # v1.6: progress tracking
+        self._total_steps    = 0
+        self._done_steps     = 0
+        self._bench_start_ts = None
+
+    # ------------------------------------------------------------------ log
+    def _log(self, msg: str, color: str = "white"):
+        self.q.put(("log", msg, color))
+
+    def _status(self, msg: str):
+        self.q.put(("status", msg))
+
+    # ------------------------------------------------------------ API calls
+    def _get(self, endpoint: str, timeout: int = 10):
+        for attempt in range(3):
+            if self.stop_event.is_set():
+                return None
+            try:
+                r = requests.get(f"{self.bitaxe_url}{endpoint}", timeout=timeout)
+                r.raise_for_status()
+                return r.json()
+            except requests.exceptions.Timeout:
+                self._log(f"Timeout {endpoint} (attempt {attempt+1}/3)", "yellow")
+            except requests.exceptions.ConnectionError:
+                self._log(f"Connection error {endpoint} (attempt {attempt+1}/3)", "red")
+            except requests.exceptions.RequestException as e:
+                self._log(f"Request error {endpoint}: {e}", "red")
+                break
+            time.sleep(5)
+        return None
+
+    def _patch_settings(self, voltage: int, frequency: int) -> bool:
+        try:
+            r = requests.patch(
+                f"{self.bitaxe_url}/api/system",
+                json={"coreVoltage": voltage, "frequency": frequency},
+                timeout=10,
+            )
+            r.raise_for_status()
+            return True
+        except requests.exceptions.RequestException as e:
+            self._log(f"Error applying settings: {e}", "red")
+            return False
+
+    def _restart(self, wait: bool = True):
+        try:
+            requests.post(f"{self.bitaxe_url}/api/system/restart", timeout=10)
+            if not wait:
+                return
+            if self.adaptive_warmup:
+                self._adaptive_wait()
+            else:
+                self._log(f"Restarting — waiting {SLEEP_TIME}s for stabilisation…", "yellow")
+                for i in range(SLEEP_TIME):
+                    if self.stop_event.is_set():
+                        return
+                    time.sleep(1)
+        except requests.exceptions.RequestException as e:
+            self._log(f"Restart error: {e}", "red")
+
+    def _adaptive_wait(self):
+        """
+        Wait for chip temperature to stabilise (±1 °C over two consecutive
+        10-second samples) instead of a fixed timer.
+        Falls back to SLEEP_TIME if temperature data is unavailable.
+        Always waits at least 20 s to let the Bitaxe boot fully.
+        """
+        MIN_WAIT  = 20
+        MAX_WAIT  = SLEEP_TIME * 2   # safety ceiling: 80 s
+        STABLE_DT = 1.0              # °C window considered stable
+        CHECK_INT = 10               # seconds between temp checks
+
+        self._log("Adaptive warm-up: waiting for boot…", "yellow")
+        elapsed = 0
+        # mandatory boot wait
+        for _ in range(MIN_WAIT):
+            if self.stop_event.is_set():
+                return
+            time.sleep(1)
+        elapsed += MIN_WAIT
+
+        prev_temp = None
+        while elapsed < MAX_WAIT:
+            if self.stop_event.is_set():
+                return
+            info = self._get("/api/system/info")
+            cur_temp = self._get_max_temp(info) if info else None
+            if cur_temp is not None:
+                if prev_temp is not None and abs(cur_temp - prev_temp) <= STABLE_DT:
+                    self._log(
+                        f"Adaptive warm-up: stable at {cur_temp:.1f}°C "
+                        f"after {elapsed}s ✓", "green"
+                    )
+                    return
+                prev_temp = cur_temp
+                self._log(
+                    f"Adaptive warm-up: {cur_temp:.1f}°C "
+                    f"(Δ{abs(cur_temp - prev_temp):.1f} from prev) — waiting…"
+                    if prev_temp != cur_temp else
+                    f"Adaptive warm-up: {cur_temp:.1f}°C — waiting…",
+                    "yellow"
+                )
+            for _ in range(CHECK_INT):
+                if self.stop_event.is_set():
+                    return
+                time.sleep(1)
+            elapsed += CHECK_INT
+
+        self._log(f"Adaptive warm-up: timeout after {elapsed}s — continuing.", "yellow")
+
+    def _set_and_restart(self, voltage: int, frequency: int, wait: bool = True):
+        self._log(f"  → {voltage}mV / {frequency}MHz", "yellow")
+        if self._patch_settings(voltage, frequency):
+            self._restart(wait=wait)
+
+    # --------------------------------------------------- model detection ---
+    def _all_string_values(self, d: dict) -> list[str]:
+        out = []
+        for v in d.values():
+            if isinstance(v, str):
+                out.append(v.lower())
+            elif isinstance(v, dict):
+                out.extend(self._all_string_values(v))
+        return out
+
+    def _detect_profile(self, system_info: dict, current_hashrate_ghs: float | None) -> dict:
+        chip_mode = self.cfg["chip_mode"]
+        if chip_mode == "single":
+            self._log("Profile: forced SINGLE-chip by user.", "green")
+            return self._make_profile("single")
+        if chip_mode == "dual":
+            self._log("Profile: forced DUAL-chip by user.", "green")
+            return self._make_profile("dual")
+
+        api_asic = system_info.get("asicCount")
+        if api_asic is not None and int(api_asic) >= 2:
+            self._log(f"Auto-detect: asicCount={api_asic} → DUAL-chip.", "green")
+            return self._make_profile("dual")
+
+        all_strings = self._all_string_values(system_info)
+        for kw in DUAL_CHIP_KEYWORDS:
+            for s in all_strings:
+                if kw in s:
+                    self._log(f"Auto-detect: found keyword '{kw}' in API field → DUAL-chip.", "green")
+                    return self._make_profile("dual")
+
+        if current_hashrate_ghs and current_hashrate_ghs > DUAL_CHIP_HASHRATE_THRESHOLD_GHS:
+            self._log(
+                f"Auto-detect: live hashrate {current_hashrate_ghs:.0f} GH/s "
+                f"> {DUAL_CHIP_HASHRATE_THRESHOLD_GHS} GH/s → DUAL-chip.", "green",
+            )
+            return self._make_profile("dual")
+
+        self._log("Auto-detect: no dual-chip signal found → SINGLE-chip.", "green")
+        return self._make_profile("single")
+
+    def _make_profile(self, kind: str) -> dict:
+        max_psu = self.cfg["max_psu_watts"]
+        if kind == "dual":
+            return {
+                "kind":              "dual",
+                "label":             "Dual-chip (GT 800/801, Duo 650 — 12V XT30)",
+                "min_input_voltage": DUAL_CHIP_VMIN,
+                "max_input_voltage": DUAL_CHIP_VMAX,
+                "max_power":         max_psu,
+                "max_temp":          self.cfg["max_temp"],
+                "max_vr_temp":       self.cfg["max_vr_temp"],
+            }
+        return {
+            "kind":              "single",
+            "label":             "Single-chip (Gamma/Supra/Ultra — 5V barrel jack)",
+            "min_input_voltage": SINGLE_CHIP_VMIN,
+            "max_input_voltage": SINGLE_CHIP_VMAX,
+            "max_power":         max_psu,
+            "max_temp":          self.cfg["max_temp"],
+            "max_vr_temp":       self.cfg["max_vr_temp"],
+        }
+
+    # ------------------------------------------------ fetch initial state --
+    def _fetch_settings(self) -> bool:
+        self._status("Connecting to Bitaxe…")
+        info = self._get("/api/system/info")
+        if info is None:
+            self._log("Cannot reach Bitaxe. Check IP and WiFi.", "red")
+            return False
+
+        if "smallCoreCount" not in info:
+            self._log("Error: smallCoreCount missing from API. Cannot continue.", "red")
+            return False
+
+        self.small_core_count = info["smallCoreCount"]
+        live_hr = info.get("hashRate")
+        self.profile = self._detect_profile(info, live_hr)
+
+        has_v  = "coreVoltage" in info
+        has_f  = "frequency"   in info
+        has_ac = "asicCount"   in info
+
+        if has_v and has_f and has_ac:
+            self.default_voltage   = info["coreVoltage"]
+            self.default_frequency = info["frequency"]
+            self.asic_count        = info["asicCount"]
+        else:
+            self._log("Fetching remaining info from /api/system/asic…", "yellow")
+            asic = self._get("/api/system/asic")
+            if asic is None:
+                self._log("Cannot fetch /api/system/asic. Cannot continue.", "red")
+                return False
+            self.default_voltage   = asic.get("defaultVoltage",   1150)
+            self.default_frequency = asic.get("defaultFrequency", 500)
+            self.asic_count        = asic.get("asicCount",        1)
+
+        if self.profile["kind"] == "dual" and (not self.asic_count or self.asic_count < 2):
+            self._log(
+                f"WARNING: API reports asicCount={self.asic_count} but profile is dual-chip. "
+                "Forcing asicCount=2 for hashrate calculation.", "yellow",
+            )
+            self.asic_count = 2
+
+        total_cores = self.small_core_count * self.asic_count
+        self._log("─" * 54, "white")
+        self._log(f"Profile      : {self.profile['label']}", "green")
+        self._log(f"ASIC count   : {self.asic_count}  (total cores: {total_cores})", "green")
+        self._log(f"Default      : {self.default_voltage}mV / {self.default_frequency}MHz", "green")
+        self._log(f"Input voltage: {self.profile['min_input_voltage']}–{self.profile['max_input_voltage']} mV", "green")
+        self._log(f"Max PSU      : {self.profile['max_power']} W", "green")
+        self._log(f"Max chip temp: {self.profile['max_temp']} °C", "green")
+        self._log(f"Max VR temp  : {self.profile['max_vr_temp']} °C", "green")
+        self._log("─" * 54, "white")
+        return True
+
+    # ----------------------------------------------------- temp helpers ---
+    def _get_max_temp(self, info: dict):
+        temps = [info.get("temp"), info.get("temp2")]
+        valid = [t for t in temps if t is not None]
+        return max(valid) if valid else None
+
+    def _get_max_vr_temp(self, info: dict):
+        vrs   = [info.get("vrTemp"), info.get("vrTemp2")]
+        valid = [t for t in vrs if t is not None and t > 0]
+        return max(valid) if valid else None
+
+    # ------------------------------------------------- error-rate helpers --
+    def _get_error_percentage(self, info: dict) -> float | None:
+        """
+        Read the ASIC error rate directly from AxeOS.
+
+        Priority (matches what AxeOS v2.x actually exposes):
+          1. 'errorPercentage'  — present in AxeOS v2.12+ (confirmed in GT 800 API)
+          2. 'asicErrorRate'    — older field name used in some forks
+          3. None               — field not available in this firmware version
+
+        We do NOT fall back to sharesRejected/sharesAccepted because those
+        counters are cumulative from device boot and are NOT reset between
+        benchmark iterations — they would produce a meaningless average that
+        reflects the entire uptime, not the current test window.
+        """
+        for field in ("errorPercentage", "asicErrorRate"):
+            val = info.get(field)
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    def _get_asic_error_counts(self, info: dict) -> list[int] | None:
+        """
+        Read per-chip cumulative errorCount from hashrateMonitor.asics[n].
+        Returns a list with one entry per chip, or None if not available.
+
+        These are used as a delta between consecutive samples so we can
+        compute the error rate increment per sample interval rather than
+        relying on the cumulative total.
+        """
+        monitor = info.get("hashrateMonitor")
+        if not isinstance(monitor, dict):
+            return None
+        asics = monitor.get("asics")
+        if not isinstance(asics, list) or not asics:
+            return None
+        counts = []
+        for chip in asics:
+            ec = chip.get("errorCount")
+            if ec is not None:
+                try:
+                    counts.append(int(ec))
+                except (TypeError, ValueError):
+                    pass
+        return counts if counts else None
+
+    # -------------------------------------------------- benchmark loop ---
+    def _benchmark_iteration(self, voltage: int, frequency: int):
+        """
+        Returns (avg_hashrate, avg_temp, efficiency_jth, hashrate_ok,
+                 avg_vr_temp, avg_error_rate, error_reason)
+
+        Error rate source priority (per sample):
+          1. errorPercentage — direct AxeOS field, matches the UI exactly.
+          2. Delta of hashrateMonitor.asics[n].errorCount between consecutive
+             samples — gives a per-interval rate for each chip; we report the
+             worst chip.
+          3. None — firmware does not expose error data.
+
+        sharesRejected / sharesAccepted are intentionally NOT used: they are
+        cumulative from boot and do not reset between benchmark steps.
+        """
+        p           = self.profile
+        expected_hr = frequency * (self.small_core_count * self.asic_count / 1000)
+
+        hash_rates, temperatures, powers, vr_temps_list, error_rates = [], [], [], [], []
+        total_samples = BENCHMARK_TIME // SAMPLE_INTERVAL
+
+        self._status(f"Testing {voltage}mV / {frequency}MHz…")
+
+        # snapshot of per-chip errorCount from the previous sample
+        prev_error_counts: list[int] | None = None
+
+        for sample in range(total_samples):
+            if self.stop_event.is_set():
+                return None, None, None, False, None, None, "STOPPED"
+
+            info = self._get("/api/system/info")
+            if info is None:
+                return None, None, None, False, None, None, "SYSTEM_INFO_FAILURE"
+
+            temp       = self._get_max_temp(info)
+            vr_temp    = self._get_max_vr_temp(info)
+            voltage_in = info.get("voltage")
+            hash_rate  = info.get("hashRate")
+            power      = info.get("power")
+
+            # --- error rate: prefer direct field, fall back to delta counts ---
+            err_rate = self._get_error_percentage(info)
+
+            cur_error_counts = self._get_asic_error_counts(info)
+            if err_rate is None and cur_error_counts is not None and prev_error_counts is not None:
+                # compute per-chip error delta since last sample
+                # divide by sample_interval to get errors/second, then
+                # express as a fraction of the expected hash operations
+                # (rough proxy — useful for relative comparison between steps)
+                if len(cur_error_counts) == len(prev_error_counts):
+                    deltas = [
+                        max(0, cur - prev)
+                        for cur, prev in zip(cur_error_counts, prev_error_counts)
+                    ]
+                    worst_delta = max(deltas)
+                    total_delta = sum(deltas)
+                    # express as percentage of total hashes in the interval
+                    # expected hashes per interval ≈ expected_hr * 1e9 * SAMPLE_INTERVAL
+                    expected_hashes = expected_hr * 1e9 * SAMPLE_INTERVAL
+                    if expected_hashes > 0:
+                        err_rate = (total_delta / expected_hashes) * 100.0
+
+            prev_error_counts = cur_error_counts
+
+            # --- safety checks ---
+            if temp is None:
+                return None, None, None, False, None, None, "TEMPERATURE_DATA_FAILURE"
+            if temp < 5:
+                return None, None, None, False, None, None, "TEMPERATURE_BELOW_5"
+            if temp >= p["max_temp"]:
+                self._log(f"⚠ Chip temp {temp:.0f}°C ≥ {p['max_temp']}°C — stopping.", "red")
+                return None, None, None, False, None, None, "CHIP_TEMP_EXCEEDED"
+            if vr_temp is not None and vr_temp >= p["max_vr_temp"]:
+                self._log(f"⚠ VR temp {vr_temp:.0f}°C ≥ {p['max_vr_temp']}°C — stopping.", "red")
+                return None, None, None, False, None, None, "VR_TEMP_EXCEEDED"
+            if voltage_in is not None:
+                if voltage_in < p["min_input_voltage"]:
+                    self._log(
+                        f"⚠ Input voltage {voltage_in} mV below {p['min_input_voltage']} mV "
+                        f"({p['label']}) — stopping.", "red"
+                    )
+                    return None, None, None, False, None, None, "INPUT_VOLTAGE_BELOW_MIN"
+                if voltage_in > p["max_input_voltage"]:
+                    self._log(
+                        f"⚠ Input voltage {voltage_in} mV above {p['max_input_voltage']} mV — stopping.", "red"
+                    )
+                    return None, None, None, False, None, None, "INPUT_VOLTAGE_ABOVE_MAX"
+            if hash_rate is None or power is None:
+                return None, None, None, False, None, None, "HASHRATE_POWER_DATA_FAILURE"
+            if power > p["max_power"]:
+                self._log(f"⚠ Power {power:.1f}W > {p['max_power']}W PSU limit — stopping.", "red")
+                return None, None, None, False, None, None, "POWER_EXCEEDED"
+
+            hash_rates.append(hash_rate)
+            temperatures.append(temp)
+            powers.append(power)
+            if vr_temp is not None:
+                vr_temps_list.append(vr_temp)
+            # skip first sample for error rate — prev_error_counts was None
+            if err_rate is not None and sample > 0:
+                error_rates.append(err_rate)
+
+            pct  = (sample + 1) / total_samples * 100
+            line = (
+                f"[{sample+1:2d}/{total_samples}] {pct:5.1f}% | "
+                f"{voltage}mV {frequency}MHz | "
+                f"HR: {hash_rate:.0f} GH/s | "
+                f"T: {temp:.0f}°C"
+            )
+            if vr_temp is not None:
+                line += f" VR: {vr_temp:.0f}°C"
+            line += f" | {power:.1f}W"
+            if err_rate is not None and sample > 0:
+                err_color = "red" if err_rate > ERR_MAX_VALID else ("yellow" if err_rate > ERR_OPT_HIGH else "green")
+                self._log(line, "white")
+                self._log(f"         Err: {err_rate:.3f}%", err_color)
+            else:
+                self._log(line, "white")
+
+            if sample < total_samples - 1:
+                time.sleep(SAMPLE_INTERVAL)
+
+        if not hash_rates:
+            return None, None, None, False, None, None, "NO_DATA_COLLECTED"
+
+        # trim outliers
+        s_hr    = sorted(hash_rates)
+        trim_hr = s_hr[3:-3] if len(s_hr) > 6 else s_hr
+        avg_hr  = sum(trim_hr) / len(trim_hr)
+
+        s_t     = sorted(temperatures)
+        trim_t  = s_t[6:] if len(s_t) > 6 else s_t
+        avg_temp = sum(trim_t) / len(trim_t)
+
+        avg_vr = None
+        if vr_temps_list:
+            s_vr   = sorted(vr_temps_list)
+            trim_v = s_vr[6:] if len(s_vr) > 6 else s_vr
+            avg_vr = sum(trim_v) / len(trim_v)
+
+        avg_pwr = sum(powers) / len(powers)
+
+        # average error rate (no trimming — keep all samples)
+        avg_err = (sum(error_rates) / len(error_rates)) if error_rates else None
+
+        if avg_hr <= 0:
+            return None, None, None, False, None, avg_err, "ZERO_HASHRATE"
+
+        eff_jth = avg_pwr / (avg_hr / 1000)
+        hr_ok   = avg_hr >= expected_hr * 0.94
+
+        self._log(f"  Avg HR   : {avg_hr:.1f} GH/s  (expected ≥ {expected_hr*0.94:.1f})", "green")
+        self._log(f"  Avg temp : {avg_temp:.1f}°C{'  VR: '+f'{avg_vr:.1f}°C' if avg_vr else ''}", "green")
+        self._log(f"  Eff      : {eff_jth:.2f} J/TH  |  Power: {avg_pwr:.1f}W", "green")
+        if avg_err is not None:
+            err_color = "red" if avg_err > ERR_MAX_VALID else ("yellow" if avg_err > ERR_OPT_HIGH else "green")
+            self._log(f"  Avg Err  : {avg_err:.3f}%", err_color)
+
+        return avg_hr, avg_temp, eff_jth, hr_ok, avg_vr, avg_err, None
+
+    # ---------------------------------------------------- save / reset ---
+    def _save(self):
+        ip       = self.cfg["ip"].replace(".", "_")
+        filename = f"bitaxe_benchmark_{ip}_{self.start_time}.json"
+        try:
+            stable   = [r for r in self.results if r.get("stable", True)]
+            pool     = stable if stable else self.results
+            top5_hr  = sorted(pool, key=lambda x: x["averageHashRate"], reverse=True)[:5]
+            top5_eff = sorted(pool, key=lambda x: x["efficiencyJTH"])[:5]
+            data = {
+                "profile":        self.profile["label"],
+                "sweep":          "2D voltage × frequency",
+                "all_results":    self.results,
+                "top_performers": top5_hr,
+                "most_efficient": top5_eff,
+            }
+            with open(filename, "w") as f:
+                json.dump(data, f, indent=4)
+            self._log(f"Results saved → {filename}", "green")
+        except IOError as e:
+            self._log(f"Error saving: {e}", "red")
+
+    def _save_csv(self):
+        """Save all results as a CSV alongside the JSON."""
+        ip       = self.cfg["ip"].replace(".", "_")
+        filename = f"bitaxe_benchmark_{ip}_{self.start_time}.csv"
+        fieldnames = ["coreVoltage", "frequency", "averageHashRate",
+                      "averageTemperature", "efficiencyJTH", "stable",
+                      "averageVRTemp", "averageErrorRate", "profile"]
+        try:
+            with open(filename, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(self.results)
+            self._log(f"CSV saved → {filename}", "green")
+        except IOError as e:
+            self._log(f"Error saving CSV: {e}", "red")
+
+    def _apply_best(self):
+        if not self.results:
+            self._log("No results — restoring device defaults.", "yellow")
+            self._set_and_restart(self.default_voltage, self.default_frequency, wait=False)
+            return
+        # prefer stable results; fall back to all results if none were stable
+        stable = [r for r in self.results if r.get("stable", True)]
+        pool   = stable if stable else self.results
+        best   = sorted(pool, key=lambda x: x["averageHashRate"], reverse=True)[0]
+        self._log(
+            f"Best: {best['coreVoltage']}mV / {best['frequency']}MHz "
+            f"→ {best['averageHashRate']:.1f} GH/s"
+            f"{'  ✓ stable' if best.get('stable') else '  ⚠ unstable'}", "green"
+        )
+        self._set_and_restart(best["coreVoltage"], best["frequency"], wait=False)
+
+    def _print_summary(self):
+        if not self.results:
+            return
+        stable = [r for r in self.results if r.get("stable", True)]
+        pool   = stable if stable else self.results
+        top5   = sorted(pool, key=lambda x: x["averageHashRate"], reverse=True)[:5]
+        self._log("─" * 54, "white")
+        self._log(
+            f"TOP 5 STABLE CONFIGURATIONS BY HASHRATE "
+            f"({len(stable)}/{len(self.results)} steps stable)", "green"
+        )
+        for i, r in enumerate(top5, 1):
+            line = (
+                f"  #{i}  {r['coreVoltage']}mV / {r['frequency']}MHz → "
+                f"{r['averageHashRate']:.1f} GH/s  {r['efficiencyJTH']:.2f} J/TH"
+                f"  {r['averageTemperature']:.1f}°C"
+            )
+            if "averageVRTemp" in r:
+                line += f"  VR {r['averageVRTemp']:.1f}°C"
+            if "averageErrorRate" in r and r["averageErrorRate"] is not None:
+                line += f"  Err {r['averageErrorRate']:.3f}%"
+            self._log(line, "green")
+
+    # ----------------------------------------------------------- run ------
+    def run(self):
+        """
+        v1.6 2-D sweep with progress tracking, ETA, early-stop on declining
+        hashrate, resume support (skips already-tested combinations), and
+        live hashrate chart updates.
+        """
+        try:
+            if not self._fetch_settings():
+                self.q.put(("done", "error"))
+                return
+
+            self._log("DISCLAIMER: overclocking may damage hardware. Use at your own risk.", "red")
+
+            start_v    = self.cfg["voltage"]
+            start_f    = self.cfg["frequency"]
+            v_step     = self.cfg["voltage_increment"]
+            f_step     = self.cfg["frequency_increment"]
+            max_v      = self.cfg["max_voltage"]
+            max_f      = self.cfg["max_frequency"]
+            early_n    = self.early_stop_n
+
+            # build set of already-done (v, f) pairs for resume
+            done_pairs = {
+                (r["coreVoltage"], r["frequency"])
+                for r in self.results
+            }
+
+            # pre-compute total steps for progress bar
+            v_levels = list(range(start_v, max_v + 1, v_step))
+            if v_levels[-1] < max_v:
+                v_levels.append(max_v)
+            f_levels = list(range(start_f, max_f + 1, f_step))
+            if f_levels[-1] < max_f:
+                f_levels.append(max_f)
+            self._total_steps = len(v_levels) * len(f_levels)
+            self._done_steps  = len(done_pairs)
+            self._bench_start_ts = time.monotonic()
+
+            def _push_progress():
+                if self._total_steps == 0:
+                    return
+                pct = min(100.0, self._done_steps / self._total_steps * 100)
+                elapsed = time.monotonic() - self._bench_start_ts
+                if self._done_steps > 0:
+                    secs_per_step = elapsed / self._done_steps
+                    remaining     = secs_per_step * (self._total_steps - self._done_steps)
+                    eta = str(timedelta(seconds=int(remaining)))
+                    eta_str = f"ETA {eta}  ({self._done_steps}/{self._total_steps})"
+                else:
+                    eta_str = f"0/{self._total_steps} steps"
+                self.q.put(("progress", pct, eta_str))
+
+            _push_progress()
+
+            cur_v = start_v
+
+            while cur_v <= max_v:
+                if self.stop_event.is_set():
+                    break
+
+                self._log("─" * 54, "white")
+                self._log(f"▶ Voltage level: {cur_v} mV", "yellow")
+
+                cur_f          = start_f
+                safety_hit     = False
+                decline_streak = 0       # consecutive steps where HR dropped
+                prev_hr        = None    # last step's avg hashrate
+
+                while cur_f <= max_f:
+                    if self.stop_event.is_set():
+                        break
+
+                    # --- resume: skip already-tested combinations ---
+                    if (cur_v, cur_f) in done_pairs:
+                        self._log(
+                            f"  Resume: skipping {cur_v}mV / {cur_f}MHz (already done).",
+                            "muted" if "muted" in C else "white"
+                        )
+                        cur_f += f_step
+                        self._done_steps += 1
+                        _push_progress()
+                        continue
+
+                    self._set_and_restart(cur_v, cur_f)
+                    if self.stop_event.is_set():
+                        break
+
+                    avg_hr, avg_t, eff, ok, avg_vr, avg_err, err = \
+                        self._benchmark_iteration(cur_v, cur_f)
+
+                    if self.stop_event.is_set():
+                        break
+
+                    self._done_steps += 1
+                    _push_progress()
+
+                    if avg_hr is not None:
+                        # push live chart point
+                        self.q.put(("chart", avg_hr))
+
+                        result = {
+                            "coreVoltage":        cur_v,
+                            "frequency":          cur_f,
+                            "averageHashRate":    avg_hr,
+                            "averageTemperature": avg_t,
+                            "efficiencyJTH":      eff,
+                            "profile":            self.profile["label"],
+                            "stable":             ok,
+                        }
+                        if avg_vr is not None:
+                            result["averageVRTemp"] = avg_vr
+                        if avg_err is not None:
+                            result["averageErrorRate"] = avg_err
+                        self.results.append(result)
+
+                        if not ok:
+                            self._log(
+                                f"  Hashrate low at {cur_v}mV / {cur_f}MHz — "
+                                "recorded, continuing frequency sweep.", "yellow"
+                            )
+
+                        # --- early-stop logic ---
+                        if early_n > 0:
+                            if prev_hr is not None and avg_hr < prev_hr:
+                                decline_streak += 1
+                                if decline_streak >= early_n:
+                                    self._log(
+                                        f"  Early-stop: HR declined for {early_n} consecutive "
+                                        f"steps at {cur_v}mV — moving to next voltage.", "yellow"
+                                    )
+                                    break
+                            else:
+                                decline_streak = 0
+                        prev_hr = avg_hr
+
+                        cur_f += f_step
+
+                    else:
+                        # hard safety limit
+                        self._log(
+                            f"  Safety limit ({err}) at {cur_v}mV / {cur_f}MHz — "
+                            "skipping remaining frequencies for this voltage.", "red"
+                        )
+                        safety_hit = True
+                        break
+
+                if self.stop_event.is_set():
+                    break
+
+                # advance voltage
+                next_v = cur_v + v_step
+                if next_v > max_v and cur_v < max_v:
+                    cur_v = max_v
+                else:
+                    cur_v = next_v
+
+            if not self.stop_event.is_set():
+                self._log("─" * 54, "white")
+                self._log("Sweep complete — all voltage × frequency combinations tested.", "green")
+
+        except Exception as e:
+            self._log(f"Unexpected error: {e}", "red")
+
+        finally:
+            self._apply_best()
+            if self.results:
+                self._save()
+                self._save_csv()
+                self._print_summary()
+            self._status("Benchmark finished.")
+            self.q.put(("progress", 100, "Done!"))
+            self.q.put(("done", "ok"))
+
+
+# ---------------------------------------------------------------------------
+# Analysis window
+# ---------------------------------------------------------------------------
+
+class AnalysisWindow(tk.Toplevel):
+    """
+    v1.6: Tabbed analysis window with:
+      • Table tab  — full results table colour-coded by error rate
+      • Heatmap tab — voltage × frequency grid coloured by hashrate or J/TH
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("📊 Benchmark Analysis v1.6")
+        self.configure(bg=C["bg"])
+        self.resizable(True, True)
+        self.minsize(860, 580)
+        self._results  = []
+        self._profile  = ""
+        self._hmap_mode = tk.StringVar(value="hashrate")
+        self._build_ui()
+        self._load_file()
+
+    def _build_ui(self):
+        # Header
+        hdr = tk.Frame(self, bg=C["accent"], height=48)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(
+            hdr, text="⛏  BENCHMARK ANALYSIS",
+            bg=C["accent"], fg="#111827",
+            font=("Courier", 14, "bold"),
+        ).pack(side="left", padx=16, pady=10)
+
+        # Best-step card
+        self._card_frame = tk.Frame(self, bg=C["panel"], pady=10, padx=14)
+        self._card_frame.pack(fill="x", padx=14, pady=(10, 4))
+        self._card_label = tk.Label(
+            self._card_frame,
+            text="Load a JSON file to see results.",
+            bg=C["panel"], fg=C["text"],
+            font=("Courier", 10), justify="left", anchor="w",
+        )
+        self._card_label.pack(fill="x")
+
+        # Notebook
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=14, pady=(4, 0))
+
+        # ── Tab 1: Table ──────────────────────────────────────────────────
+        tab_table = tk.Frame(nb, bg=C["bg"])
+        nb.add(tab_table, text="  📋  Results Table  ")
+
+        tbl_outer = tk.Frame(tab_table, bg=C["bg"])
+        tbl_outer.pack(fill="both", expand=True, pady=4)
+
+        cols = ("Volt (mV)", "Freq (MHz)", "HR (GH/s)", "Power (W)",
+                "J/TH", "Temp (°C)", "VR Temp", "Err %", "Status")
+        self._tree = ttk.Treeview(tbl_outer, columns=cols, show="headings", height=16)
+        col_widths = [80, 85, 90, 75, 70, 75, 70, 70, 100]
+        for col, w in zip(cols, col_widths):
+            self._tree.heading(col, text=col)
+            self._tree.column(col, width=w, anchor="center")
+
+        sb = ttk.Scrollbar(tbl_outer, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._tree.pack(fill="both", expand=True)
+
+        self._tree.tag_configure("optimal",    background="#14532d", foreground=C["text"])
+        self._tree.tag_configure("acceptable", background="#422006", foreground=C["text"])
+        self._tree.tag_configure("discarded",  background="#450a0a", foreground="#9ca3af")
+        self._tree.tag_configure("nodata",     background="#1e293b", foreground=C["muted"])
+        self._tree.tag_configure("best",       background="#854d0e", foreground="#fef08a")
+
+        # Legend
+        legend = tk.Frame(tab_table, bg=C["bg"])
+        legend.pack(fill="x", pady=(4, 8))
+        for bg, label in [
+            ("#14532d", "Optimal (0.20–0.70 %)"),
+            ("#422006", "Acceptable (0.70–1.00 %)"),
+            ("#450a0a", "Discarded (> 1.00 %)"),
+            ("#854d0e", "★ Best step"),
+            ("#1e293b", "No error data"),
+        ]:
+            tk.Label(legend, text="  ", bg=bg, width=2).pack(side="left")
+            tk.Label(legend, text=f" {label}   ", bg=C["bg"], fg=C["muted"],
+                     font=("Courier", 8)).pack(side="left")
+
+        # ── Tab 2: Heatmap ────────────────────────────────────────────────
+        tab_heat = tk.Frame(nb, bg=C["bg"])
+        nb.add(tab_heat, text="  🔥  Heatmap  ")
+
+        ctrl = tk.Frame(tab_heat, bg=C["bg"])
+        ctrl.pack(fill="x", padx=8, pady=6)
+        tk.Label(ctrl, text="Colour by:", bg=C["bg"], fg=C["text"],
+                 font=("Courier", 9)).pack(side="left")
+        for txt, val in [("Hashrate (GH/s)", "hashrate"), ("Efficiency (J/TH)", "jth")]:
+            ttk.Radiobutton(
+                ctrl, text=txt, variable=self._hmap_mode, value=val,
+                command=self._redraw_heatmap,
+            ).pack(side="left", padx=8)
+
+        self._hmap_canvas = tk.Canvas(tab_heat, bg=C["log_bg"],
+                                       highlightthickness=0)
+        self._hmap_canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._hmap_canvas.bind("<Configure>", lambda e: self._redraw_heatmap())
+
+    def _load_file(self):
+        path = filedialog.askopenfilename(
+            title="Select benchmark JSON file",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            self.destroy()
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot read file:\n{e}", parent=self)
+            self.destroy()
+            return
+
+        results = data.get("all_results", [])
+        if not results:
+            messagebox.showwarning("Empty", "No results found in the JSON file.", parent=self)
+            self.destroy()
+            return
+
+        self._results = results
+        self._profile = data.get("profile", "unknown")
+        self._populate(results, self._profile)
+        self.after(100, self._redraw_heatmap)
+
+    def _populate(self, results: list, profile: str):
+        for row in self._tree.get_children():
+            self._tree.delete(row)
+
+        valid_steps   = []
+        optimal_steps = []
+
+        for r in results:
+            err = r.get("averageErrorRate")
+            if err is None:
+                tag = "nodata"
+            elif err > ERR_MAX_VALID:
+                tag = "discarded"
+            elif ERR_OPT_LOW <= err <= ERR_OPT_HIGH:
+                tag = "optimal"
+                valid_steps.append(r)
+                optimal_steps.append(r)
+            else:
+                tag = "acceptable"
+                valid_steps.append(r)
+            r["_tag"] = tag
+
+        pool = optimal_steps if optimal_steps else valid_steps
+        best = None
+        if pool:
+            best = min(pool, key=lambda x: x["efficiencyJTH"])
+
+        if best is None:
+            no_err = [r for r in results if r.get("averageErrorRate") is None]
+            if no_err:
+                best = min(no_err, key=lambda x: x["efficiencyJTH"])
+
+        for r in results:
+            err     = r.get("averageErrorRate")
+            vr_str  = f"{r['averageVRTemp']:.1f}" if "averageVRTemp" in r else "—"
+            err_str = f"{err:.3f}" if err is not None else "—"
+            tag     = r["_tag"]
+
+            is_best = (best is not None and
+                       r["coreVoltage"] == best["coreVoltage"] and
+                       r["frequency"]   == best["frequency"])
+            if is_best:
+                tag = "best"
+
+            self._tree.insert("", "end", values=(
+                r["coreVoltage"],
+                r["frequency"],
+                f"{r['averageHashRate']:.1f}",
+                f"{r['averageHashRate'] * r['efficiencyJTH'] / 1000:.1f}",
+                f"{r['efficiencyJTH']:.2f}",
+                f"{r['averageTemperature']:.1f}",
+                vr_str,
+                err_str,
+                "★ BEST" if is_best else tag.upper().replace("_", " "),
+            ), tags=(tag,))
+
+        if best:
+            err_b   = best.get("averageErrorRate")
+            err_txt = f"{err_b:.3f} %" if err_b is not None else "no data"
+            power_b = best["averageHashRate"] * best["efficiencyJTH"] / 1000
+            win_msg = (
+                f"  ★  BEST CONFIGURATION  ★\n\n"
+                f"  Profile   : {profile}\n"
+                f"  Voltage   : {best['coreVoltage']} mV\n"
+                f"  Frequency : {best['frequency']} MHz\n"
+                f"  Hashrate  : {best['averageHashRate']:.1f} GH/s\n"
+                f"  Power     : {power_b:.1f} W\n"
+                f"  Efficiency: {best['efficiencyJTH']:.2f} J/TH\n"
+                f"  Chip temp : {best['averageTemperature']:.1f} °C"
+            )
+            if "averageVRTemp" in best:
+                win_msg += f"\n  VR temp   : {best['averageVRTemp']:.1f} °C"
+            win_msg += f"\n  Error rate: {err_txt}"
+            pool_name = ("optimal window (0.20–0.70 %)" if optimal_steps else
+                         ("valid steps (≤ 1.00 %)" if valid_steps else
+                          "all steps (no error data)"))
+            win_msg += f"\n\n  Selected from: {pool_name}"
+            self._card_label.config(text=win_msg, fg=C["yellow"])
+        else:
+            self._card_label.config(
+                text="  No valid steps found (all steps have error rate > 1 %).",
+                fg=C["red"])
+
+    def _redraw_heatmap(self):
+        """Draw an interactive voltage × frequency heatmap on the canvas."""
+        c      = self._hmap_canvas
+        c.delete("all")
+        data   = self._results
+        if not data:
+            return
+
+        mode   = self._hmap_mode.get()     # "hashrate" or "jth"
+        W      = c.winfo_width()  or 700
+        H      = c.winfo_height() or 400
+
+        # unique sorted axes
+        voltages = sorted(set(r["coreVoltage"] for r in data))
+        freqs    = sorted(set(r["frequency"]   for r in data))
+        nv, nf   = len(voltages), len(freqs)
+        if nv == 0 or nf == 0:
+            return
+
+        # build lookup
+        lookup = {(r["coreVoltage"], r["frequency"]): r for r in data}
+
+        # value range
+        vals = []
+        for r in data:
+            v = r["averageHashRate"] if mode == "hashrate" else r["efficiencyJTH"]
+            vals.append(v)
+        lo, hi = min(vals), max(vals)
+        span   = hi - lo if hi != lo else 1.0
+
+        # layout margins
+        ML, MR, MT, MB = 60, 20, 30, 50
+        cell_w = (W - ML - MR) / nf
+        cell_h = (H - MT - MB) / nv
+
+        def heat_color(val):
+            """Map value to colour: blue → green → orange → red."""
+            t = (val - lo) / span          # 0..1
+            if mode == "jth":
+                t = 1 - t                  # lower J/TH = better = hot colour
+            r_c = int(min(255, t * 2 * 255))
+            g_c = int(min(255, (1 - abs(t - 0.5) * 2) * 255))
+            b_c = int(max(0, (1 - t * 2) * 255))
+            return f"#{r_c:02x}{g_c:02x}{b_c:02x}"
+
+        # draw cells
+        for vi, volt in enumerate(voltages):
+            for fi, freq in enumerate(freqs):
+                rec = lookup.get((volt, freq))
+                x0  = ML + fi * cell_w
+                y0  = MT + vi * cell_h
+                x1  = x0 + cell_w
+                y1  = y0 + cell_h
+                if rec is None:
+                    c.create_rectangle(x0, y0, x1, y1, fill="#1f2937", outline="#374151")
+                    continue
+                val   = rec["averageHashRate"] if mode == "hashrate" else rec["efficiencyJTH"]
+                color = heat_color(val)
+                c.create_rectangle(x0, y0, x1, y1, fill=color, outline="#111827")
+                # label inside cell if large enough
+                if cell_w > 38 and cell_h > 16:
+                    c.create_text(
+                        (x0 + x1) / 2, (y0 + y1) / 2,
+                        text=f"{val:.0f}",
+                        fill="#111827" if (val - lo) / span > 0.4 else C["text"],
+                        font=("Courier", 7),
+                    )
+
+        # voltage labels (y axis)
+        for vi, volt in enumerate(voltages):
+            y = MT + vi * cell_h + cell_h / 2
+            c.create_text(ML - 4, y, text=str(volt),
+                          fill=C["muted"], font=("Courier", 7), anchor="e")
+
+        # frequency labels (x axis)
+        for fi, freq in enumerate(freqs):
+            x = ML + fi * cell_w + cell_w / 2
+            c.create_text(x, H - MB + 8, text=str(freq),
+                          fill=C["muted"], font=("Courier", 7), anchor="n")
+
+        # axis titles
+        c.create_text(ML - 48, MT + (H - MT - MB) / 2,
+                      text="Voltage (mV)", fill=C["muted"],
+                      font=("Courier", 7), angle=90)
+        c.create_text(ML + (W - ML - MR) / 2, H - 8,
+                      text="Frequency (MHz)", fill=C["muted"],
+                      font=("Courier", 7))
+
+        # colour scale bar
+        bar_x = W - MR - 10
+        bar_h = H - MT - MB
+        for i in range(bar_h):
+            t   = 1 - i / bar_h
+            val = lo + t * span
+            col = heat_color(val)
+            c.create_line(bar_x, MT + i, bar_x + 8, MT + i, fill=col)
+        c.create_text(bar_x + 4, MT - 8,
+                      text=f"{hi:.0f}", fill=C["muted"], font=("Courier", 6))
+        c.create_text(bar_x + 4, MT + bar_h + 8,
+                      text=f"{lo:.0f}", fill=C["muted"], font=("Courier", 6))
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("BitaxeBenchGui 1.6")
+        self.configure(bg=C["bg"])
+        self.resizable(True, True)
+        self.minsize(660, 640)
+
+        self._benchmark_thread = None
+        self._engine           = None
+        self._log_queue        = queue.Queue()
+
+        self._apply_theme()
+        self._build_ui()
+        self._poll_queue()
+
+    # --------------------------------------------------------- ttk theme --
+    def _apply_theme(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        bg   = C["bg"]
+        pnl  = C["panel"]
+        txt  = C["text"]
+        mute = C["muted"]
+        acc  = C["accent"]
+        card = C["card"]
+
+        style.configure(".",
+            background=bg, foreground=txt,
+            fieldbackground=card, troughcolor=pnl,
+            selectbackground=acc, selectforeground="#111827",
+            font=("Courier", 9),
+        )
+        style.configure("TFrame",      background=bg)
+        style.configure("TLabel",      background=bg, foreground=txt)
+        style.configure("TLabelframe", background=pnl, foreground=acc,
+                        bordercolor=C["separator"], lightcolor=pnl, darkcolor=pnl)
+        style.configure("TLabelframe.Label", background=pnl, foreground=acc,
+                        font=("Courier", 9, "bold"))
+
+        style.configure("TEntry",   fieldbackground=card, foreground=txt,
+                        insertcolor=txt, bordercolor=C["separator"])
+        style.configure("TSpinbox", fieldbackground=card, foreground=txt,
+                        insertcolor=txt, arrowcolor=acc, bordercolor=C["separator"])
+        style.configure("TRadiobutton", background=bg, foreground=txt,
+                        indicatorcolor=acc)
+        style.map("TRadiobutton",
+            background=[("active", pnl)],
+            foreground=[("active", acc)],
+        )
+
+        # Default button
+        style.configure("TButton",
+            background=pnl, foreground=txt,
+            bordercolor=C["separator"], lightcolor=pnl, darkcolor=pnl,
+            relief="flat", padding=(8, 5),
+        )
+        style.map("TButton",
+            background=[("active", card), ("pressed", C["separator"])],
+            foreground=[("active", acc)],
+        )
+
+        # Orange accent button (Start / Analyse)
+        style.configure("Accent.TButton",
+            background=acc, foreground="#111827",
+            bordercolor=C["accent_dark"], lightcolor=acc, darkcolor=C["accent_dark"],
+            relief="flat", padding=(10, 6), font=("Courier", 9, "bold"),
+        )
+        style.map("Accent.TButton",
+            background=[("active", C["accent_dark"]), ("pressed", C["accent_dark"])],
+        )
+
+        # Red danger button (Stop)
+        style.configure("Danger.TButton",
+            background="#7f1d1d", foreground=txt,
+            bordercolor="#991b1b", lightcolor="#7f1d1d", darkcolor="#7f1d1d",
+            relief="flat", padding=(8, 5),
+        )
+        style.map("Danger.TButton",
+            background=[("active", "#991b1b"), ("disabled", "#374151")],
+            foreground=[("disabled", mute)],
+        )
+
+        style.configure("TSeparator", background=C["separator"])
+        style.configure("TScrollbar",
+            background=pnl, troughcolor=bg, arrowcolor=mute,
+            bordercolor=bg, lightcolor=pnl, darkcolor=pnl,
+        )
+
+        # Treeview for analysis window
+        style.configure("Treeview",
+            background=C["panel"], foreground=txt,
+            fieldbackground=C["panel"], rowheight=22,
+            bordercolor=C["separator"],
+        )
+        style.configure("Treeview.Heading",
+            background=C["accent"], foreground="#111827",
+            font=("Courier", 8, "bold"), relief="flat",
+        )
+        style.map("Treeview",
+            background=[("selected", acc)],
+            foreground=[("selected", "#111827")],
+        )
+
+    # -------------------------------------------------------------- UI build
+    def _build_ui(self):
+        PAD = {"padx": 10, "pady": 4}
+
+        # ── header banner ─────────────────────────────────────────────────
+        banner = tk.Frame(self, bg=C["accent"], height=52)
+        banner.pack(fill="x")
+        banner.pack_propagate(False)
+        tk.Label(
+            banner, text="⛏  BITAXE ALL CHIP BENCHMARK v1.6",
+            bg=C["accent"], fg="#111827",
+            font=("Courier", 15, "bold"),
+        ).pack(side="left", padx=18, pady=10)
+        tk.Label(
+            banner, text="open-source ASIC tuning tool",
+            bg=C["accent"], fg="#78350f",
+            font=("Courier", 8),
+        ).pack(side="left", padx=0, pady=16)
+
+        # ── configuration frame ───────────────────────────────────────────
+        cfg_frame = ttk.LabelFrame(self, text="  Configuration", padding=10)
+        cfg_frame.pack(fill="x", padx=12, pady=(10, 4))
+        cfg_frame.columnconfigure(1, weight=1)
+
+        row = 0
+
+        # IP
+        ttk.Label(cfg_frame, text="Bitaxe IP address:").grid(row=row, column=0, sticky="w", **PAD)
+        self._ip_var = tk.StringVar(value=DEFAULTS["ip"])
+        ip_entry = ttk.Entry(cfg_frame, textvariable=self._ip_var, width=22)
+        ip_entry.grid(row=row, column=1, sticky="w", **PAD)
+        row += 1
+
+        ttk.Separator(cfg_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=6
+        )
+        row += 1
+
+        # Chip detection
+        ttk.Label(cfg_frame, text="Chip detection:").grid(row=row, column=0, sticky="w", **PAD)
+        self._chip_var = tk.StringVar(value=DEFAULTS["chip_mode"])
+        chip_frame = ttk.Frame(cfg_frame)
+        chip_frame.grid(row=row, column=1, columnspan=2, sticky="w")
+        for label, val in [("Auto (recommended)", "auto"), ("Single chip", "single"), ("Dual chip", "dual")]:
+            ttk.Radiobutton(chip_frame, text=label, variable=self._chip_var, value=val).pack(
+                side="left", padx=(0, 12)
+            )
+        row += 1
+
+        ttk.Separator(cfg_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=6
+        )
+        row += 1
+
+        ttk.Label(cfg_frame, text="Starting settings", font=("Courier", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", **PAD
+        )
+        row += 1
+
+        fields = [
+            ("Initial voltage (mV):",      "_v_voltage",    DEFAULTS["voltage"],             MIN_ALLOWED_VOLTAGE, MAX_ALLOWED_VOLTAGE),
+            ("Initial frequency (MHz):",   "_v_frequency",  DEFAULTS["frequency"],           MIN_ALLOWED_FREQ,    MAX_ALLOWED_FREQ),
+            ("PSU max wattage (W):",        "_v_psu",        DEFAULTS["max_psu_watts"],       10,                  500),
+            ("Max chip temp (°C):",         "_v_max_temp",   DEFAULTS["max_temp"],            40,                  90),
+            ("Max VR temp (°C):",           "_v_max_vr",     DEFAULTS["max_vr_temp"],         40,                  110),
+            ("Voltage step (mV):",          "_v_v_step",     DEFAULTS["voltage_increment"],   5,                   100),
+            ("Frequency step (MHz):",       "_v_f_step",     DEFAULTS["frequency_increment"], 5,                   100),
+            ("Max voltage (mV):",           "_v_max_voltage",DEFAULTS["max_voltage"],         MIN_ALLOWED_VOLTAGE, MAX_ALLOWED_VOLTAGE),
+            ("Max frequency (MHz):",        "_v_max_freq",   DEFAULTS["max_frequency"],       MIN_ALLOWED_FREQ,    MAX_ALLOWED_FREQ),
+            ("Max error rate (%):",         "_v_err_max",    DEFAULTS["err_max_valid"],       0,                   10),
+            ("Early-stop steps (0=off):",   "_v_early_stop", DEFAULTS["early_stop_steps"],    0,                   10),
+        ]
+
+        for label, attr, default, lo, hi in fields:
+            ttk.Label(cfg_frame, text=label).grid(row=row, column=0, sticky="w", **PAD)
+            # err_max uses DoubleVar (float), others use IntVar
+            if attr == "_v_err_max":
+                var = tk.DoubleVar(value=default)
+            else:
+                var = tk.IntVar(value=default)
+            setattr(self, attr, var)
+            spin = ttk.Spinbox(cfg_frame, from_=lo, to=hi, textvariable=var, width=8,
+                               increment=0.1 if attr == "_v_err_max" else 1)
+            spin.grid(row=row, column=1, sticky="w", **PAD)
+            row += 1
+
+        # Adaptive warm-up checkbox
+        self._v_adaptive = tk.BooleanVar(value=DEFAULTS["adaptive_warmup"])
+        ttk.Checkbutton(cfg_frame, text="Adaptive warm-up (wait for temp stability)",
+                        variable=self._v_adaptive).grid(
+            row=row, column=0, columnspan=2, sticky="w", **PAD)
+        row += 1
+
+        # Buttons row
+        btn_frame = ttk.Frame(cfg_frame)
+        btn_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 2))
+
+        ttk.Button(btn_frame, text="↺  Reset", command=self._reset_defaults).pack(
+            side="left", padx=(0, 6)
+        )
+        self._start_btn = ttk.Button(
+            btn_frame, text="▶  Start Benchmark",
+            command=self._start, style="Accent.TButton"
+        )
+        self._start_btn.pack(side="left", padx=(0, 6))
+
+        ttk.Button(
+            btn_frame, text="⏭  Resume",
+            command=self._resume, style="Accent.TButton"
+        ).pack(side="left", padx=(0, 6))
+
+        ttk.Button(
+            btn_frame, text="📊  Analyse Results",
+            command=self._open_analysis, style="Accent.TButton"
+        ).pack(side="left", padx=(0, 6))
+
+        ttk.Button(
+            btn_frame, text="📄  Export CSV",
+            command=self._export_csv,
+        ).pack(side="left")
+
+        # ── status bar ────────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="Idle — configure above and press Start.")
+        status_bar = tk.Label(
+            self, textvariable=self._status_var,
+            bg=C["panel"], fg=C["muted"],
+            anchor="w", padx=8, pady=4,
+            font=("Courier", 8),
+        )
+        status_bar.pack(fill="x", padx=12, pady=(4, 0))
+
+        # ── progress bar ──────────────────────────────────────────────────
+        prog_frame = tk.Frame(self, bg=C["bg"])
+        prog_frame.pack(fill="x", padx=12, pady=(4, 0))
+        self._progress_var = tk.DoubleVar(value=0)
+        self._progress_bar = ttk.Progressbar(
+            prog_frame, variable=self._progress_var,
+            maximum=100, mode="determinate", length=400,
+        )
+        self._progress_bar.pack(side="left", fill="x", expand=True)
+        self._eta_var = tk.StringVar(value="")
+        tk.Label(prog_frame, textvariable=self._eta_var,
+                 bg=C["bg"], fg=C["muted"], font=("Courier", 8), width=22,
+                 anchor="e").pack(side="left", padx=(8, 0))
+
+        # ── live hashrate canvas ───────────────────────────────────────────
+        chart_frame = ttk.LabelFrame(self, text="  Live Hashrate (GH/s)", padding=4)
+        chart_frame.pack(fill="x", padx=12, pady=(6, 0))
+        self._chart_canvas = tk.Canvas(
+            chart_frame, bg=C["log_bg"], height=90,
+            highlightthickness=0,
+        )
+        self._chart_canvas.pack(fill="x")
+        self._chart_data: list[float] = []   # hashrate history for live chart
+
+        # ── log area ──────────────────────────────────────────────────────
+        log_frame = ttk.LabelFrame(self, text="  Output", padding=4)
+        log_frame.pack(fill="both", expand=True, padx=12, pady=(4, 4))
+
+        self._log_text = scrolledtext.ScrolledText(
+            log_frame, state="disabled", wrap="word",
+            font=("Courier", 9), height=20,
+            bg=C["log_bg"], fg=C["text"],
+            insertbackground=C["text"],
+            selectbackground=C["accent"],
+            relief="flat", borderwidth=0,
+        )
+        self._log_text.pack(fill="both", expand=True)
+
+        # colour tags
+        self._log_text.tag_config("green",  foreground=C["green"])
+        self._log_text.tag_config("yellow", foreground=C["yellow"])
+        self._log_text.tag_config("red",    foreground=C["red"])
+        self._log_text.tag_config("white",  foreground=C["text"])
+
+        # ── bottom bar ────────────────────────────────────────────────────
+        bot_frame = tk.Frame(self, bg=C["bg"])
+        bot_frame.pack(fill="x", padx=12, pady=(0, 10))
+
+        self._stop_btn = ttk.Button(
+            bot_frame, text="⏹  Stop Benchmark",
+            command=self._stop, state="disabled",
+            style="Danger.TButton",
+        )
+        self._stop_btn.pack(side="left")
+
+        ttk.Button(bot_frame, text="🗑  Clear log", command=self._clear_log).pack(
+            side="left", padx=8
+        )
+
+    # --------------------------------------------------- defaults reset ---
+    def _reset_defaults(self):
+        self._ip_var.set(DEFAULTS["ip"])
+        self._chip_var.set(DEFAULTS["chip_mode"])
+        self._v_voltage.set(DEFAULTS["voltage"])
+        self._v_frequency.set(DEFAULTS["frequency"])
+        self._v_psu.set(DEFAULTS["max_psu_watts"])
+        self._v_max_temp.set(DEFAULTS["max_temp"])
+        self._v_max_vr.set(DEFAULTS["max_vr_temp"])
+        self._v_v_step.set(DEFAULTS["voltage_increment"])
+        self._v_f_step.set(DEFAULTS["frequency_increment"])
+        self._v_max_voltage.set(DEFAULTS["max_voltage"])
+        self._v_max_freq.set(DEFAULTS["max_frequency"])
+        self._v_err_max.set(DEFAULTS["err_max_valid"])
+        self._v_early_stop.set(DEFAULTS["early_stop_steps"])
+        self._v_adaptive.set(DEFAULTS["adaptive_warmup"])
+        self._append_log("Settings reset to defaults.", "yellow")
+
+    # --------------------------------------------------------- log helpers
+    def _append_log(self, msg: str, color: str = "white"):
+        self._log_text.config(state="normal")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log_text.insert("end", f"[{ts}] {msg}\n", color)
+        self._log_text.see("end")
+        self._log_text.config(state="disabled")
+
+    def _clear_log(self):
+        self._log_text.config(state="normal")
+        self._log_text.delete("1.0", "end")
+        self._log_text.config(state="disabled")
+
+    # --------------------------------------------------- queue polling ---
+    def _poll_queue(self):
+        try:
+            while True:
+                item = self._log_queue.get_nowait()
+                kind = item[0]
+                if kind == "log":
+                    _, msg, color = item
+                    self._append_log(msg, color)
+                elif kind == "status":
+                    _, msg = item
+                    self._status_var.set(msg)
+                elif kind == "progress":
+                    _, pct, eta_str = item
+                    self._progress_var.set(pct)
+                    self._eta_var.set(eta_str)
+                elif kind == "chart":
+                    _, hr_value = item
+                    self._chart_data.append(hr_value)
+                    self._redraw_chart()
+                elif kind == "done":
+                    self._on_benchmark_done()
+        except queue.Empty:
+            pass
+        self.after(200, self._poll_queue)
+
+    def _redraw_chart(self):
+        """Redraws the live hashrate sparkline on the canvas."""
+        c = self._chart_canvas
+        c.delete("all")
+        data = self._chart_data
+        if len(data) < 2:
+            return
+        w = c.winfo_width() or 600
+        h = c.winfo_height() or 90
+        margin = 6
+        lo, hi = min(data), max(data)
+        span = hi - lo if hi != lo else 1.0
+
+        def x(i):
+            return margin + (i / (len(data) - 1)) * (w - 2 * margin)
+
+        def y(v):
+            return margin + (1 - (v - lo) / span) * (h - 2 * margin)
+
+        # draw grid lines
+        for pct in [0.25, 0.5, 0.75]:
+            yg = margin + (1 - pct) * (h - 2 * margin)
+            c.create_line(margin, yg, w - margin, yg, fill="#1f2937", width=1)
+
+        # draw line
+        pts = []
+        for i, v in enumerate(data):
+            pts.extend([x(i), y(v)])
+        if len(pts) >= 4:
+            c.create_line(*pts, fill=C["accent"], width=2, smooth=True)
+
+        # draw last value label
+        last = data[-1]
+        c.create_text(w - margin - 2, y(last) - 8,
+                      text=f"{last:.0f}", fill=C["accent"],
+                      font=("Courier", 7), anchor="e")
+
+    # ------------------------------------------------------ validation ---
+    def _validate(self) -> dict | None:
+        ip = self._ip_var.get().strip()
+        if not ip:
+            messagebox.showerror("Missing IP", "Please enter the Bitaxe IP address.")
+            return None
+
+        try:
+            v          = self._v_voltage.get()
+            f          = self._v_frequency.get()
+            psu        = self._v_psu.get()
+            mt         = self._v_max_temp.get()
+            mvr        = self._v_max_vr.get()
+            v_step     = self._v_v_step.get()
+            f_step     = self._v_f_step.get()
+            max_v      = self._v_max_voltage.get()
+            max_f      = self._v_max_freq.get()
+            err_max    = self._v_err_max.get()
+            early_stop = self._v_early_stop.get()
+        except tk.TclError:
+            messagebox.showerror("Invalid input", "All numeric fields must be valid numbers.")
+            return None
+
+        errors = []
+        if not (MIN_ALLOWED_VOLTAGE <= v <= MAX_ALLOWED_VOLTAGE):
+            errors.append(f"Voltage must be {MIN_ALLOWED_VOLTAGE}–{MAX_ALLOWED_VOLTAGE} mV.")
+        if not (MIN_ALLOWED_FREQ <= f <= MAX_ALLOWED_FREQ):
+            errors.append(f"Frequency must be {MIN_ALLOWED_FREQ}–{MAX_ALLOWED_FREQ} MHz.")
+        if psu < 10:
+            errors.append("PSU wattage must be ≥ 10 W.")
+        if not (40 <= mt <= 90):
+            errors.append("Max chip temp must be 40–90 °C.")
+        if not (40 <= mvr <= 110):
+            errors.append("Max VR temp must be 40–110 °C.")
+        if not (5 <= v_step <= 100):
+            errors.append("Voltage step must be 5–100 mV.")
+        if not (5 <= f_step <= 100):
+            errors.append("Frequency step must be 5–100 MHz.")
+        if not (MIN_ALLOWED_VOLTAGE <= max_v <= MAX_ALLOWED_VOLTAGE):
+            errors.append(f"Max voltage must be {MIN_ALLOWED_VOLTAGE}–{MAX_ALLOWED_VOLTAGE} mV.")
+        if max_v < v:
+            errors.append("Max voltage must be ≥ initial voltage.")
+        if not (MIN_ALLOWED_FREQ <= max_f <= MAX_ALLOWED_FREQ):
+            errors.append(f"Max frequency must be {MIN_ALLOWED_FREQ}–{MAX_ALLOWED_FREQ} MHz.")
+        if max_f < f:
+            errors.append("Max frequency must be ≥ initial frequency.")
+        if not (0.0 < err_max <= 10.0):
+            errors.append("Max error rate must be between 0.1 and 10 %.")
+        if errors:
+            messagebox.showerror("Validation error", "\n".join(errors))
+            return None
+
+        return {
+            "ip":                  ip,
+            "voltage":             v,
+            "frequency":           f,
+            "max_psu_watts":       psu,
+            "max_temp":            mt,
+            "max_vr_temp":         mvr,
+            "chip_mode":           self._chip_var.get(),
+            "voltage_increment":   v_step,
+            "frequency_increment": f_step,
+            "max_voltage":         max_v,
+            "max_frequency":       max_f,
+            "err_max_valid":       err_max,
+            "early_stop_steps":    early_stop,
+            "adaptive_warmup":     self._v_adaptive.get(),
+            "resume_results":      [],   # filled by _resume()
+        }
+
+    # --------------------------------------------------------- start/stop
+    def _start(self):
+        cfg = self._validate()
+        if cfg is None:
+            return
+
+        self._chart_data.clear()
+        self._progress_var.set(0)
+        self._eta_var.set("")
+        self._chart_canvas.delete("all")
+
+        self._start_btn.config(state="disabled")
+        self._stop_btn.config(state="normal")
+        self._status_var.set("Benchmark running…")
+        self._append_log("=" * 54, "white")
+        self._append_log("Benchmark started.", "green")
+
+        self._log_queue = queue.Queue()
+        self._engine    = BitaxeBenchmark(cfg, self._log_queue)
+
+        self._benchmark_thread = threading.Thread(
+            target=self._engine.run, daemon=True
+        )
+        self._benchmark_thread.start()
+
+    def _resume(self):
+        """Load a partial JSON and resume from where it left off."""
+        path = filedialog.askopenfilename(
+            title="Select partial benchmark JSON to resume",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            prior = data.get("all_results", [])
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot read file:\n{e}")
+            return
+
+        cfg = self._validate()
+        if cfg is None:
+            return
+
+        cfg["resume_results"] = prior
+        skipped = len(prior)
+        self._append_log(f"Resume: skipping {skipped} already-tested steps.", "yellow")
+
+        self._chart_data.clear()
+        self._progress_var.set(0)
+        self._eta_var.set("")
+        self._chart_canvas.delete("all")
+
+        self._start_btn.config(state="disabled")
+        self._stop_btn.config(state="normal")
+        self._status_var.set("Benchmark resuming…")
+
+        self._log_queue = queue.Queue()
+        self._engine    = BitaxeBenchmark(cfg, self._log_queue)
+        self._benchmark_thread = threading.Thread(
+            target=self._engine.run, daemon=True
+        )
+        self._benchmark_thread.start()
+
+    def _export_csv(self):
+        """Export the last engine results (or ask for a JSON) to CSV."""
+        results = None
+        if self._engine and self._engine.results:
+            results = self._engine.results
+        else:
+            path = filedialog.askopenfilename(
+                title="Select benchmark JSON to export",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                results = data.get("all_results", [])
+            except Exception as e:
+                messagebox.showerror("Error", f"Cannot read file:\n{e}")
+                return
+
+        if not results:
+            messagebox.showwarning("No data", "No results to export.")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            title="Save CSV as",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+        )
+        if not save_path:
+            return
+
+        fieldnames = ["coreVoltage", "frequency", "averageHashRate",
+                      "averageTemperature", "efficiencyJTH", "stable",
+                      "averageVRTemp", "averageErrorRate", "profile"]
+        try:
+            with open(save_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(results)
+            self._append_log(f"CSV exported → {save_path}", "green")
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot write CSV:\n{e}")
+
+    def _stop(self):
+        if self._engine:
+            self._engine.stop_event.set()
+            self._append_log("Stop requested — finishing current sample…", "yellow")
+            self._stop_btn.config(state="disabled")
+
+    def _on_benchmark_done(self):
+        self._start_btn.config(state="normal")
+        self._stop_btn.config(state="disabled")
+        self._append_log("─ Benchmark finished ─", "green")
+        self._progress_var.set(100)
+        self._eta_var.set("Done!")
+        # play completion sound
+        try:
+            if _HAS_WINSOUND:
+                winsound.MessageBeep(winsound.MB_ICONINFORMATION)
+            else:
+                self.bell()
+        except Exception:
+            pass
+
+    # -------------------------------------------- open analysis window ---
+    def _open_analysis(self):
+        AnalysisWindow(self)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
